@@ -73,7 +73,7 @@ Rules for choosing the correct candidate:
 Looking at the floor plan image, return ONLY this JSON (no extra text):
 {{"boundary_index": <integer 0-{len(candidates)-1}>, "confidence": "high|medium|low", "reason": "<one sentence>"}}"""
 
-    user_content = [{"type": "text", "text": prompt}]
+    user_content: list[dict] = [{"type": "text", "text": prompt}]
 
     ext = os.path.splitext(reference_image_path)[1].lower()
     if ext in {'.png', '.jpg', '.jpeg'}:
@@ -93,7 +93,7 @@ Looking at the floor plan image, return ONLY this JSON (no extra text):
 
     response = client.chat.completions.create(
         model=AI_MODEL,
-        messages=[{"role": "user", "content": user_content}],
+        messages=[{"role": "user", "content": user_content}],  # type: ignore[arg-type]
         max_tokens=256
     )
 
@@ -578,7 +578,7 @@ WALL FIXTURE ROTATION RULES (CRITICAL — always follow):
   Any placement outside these bounds is INVALID.
 """
 
-    user_content = [{"type": "text", "text": prompt}]
+    user_content: list[dict] = [{"type": "text", "text": prompt}]
 
     if reference_file_path and os.path.exists(reference_file_path):
         ext = os.path.splitext(reference_file_path)[1].lower()
@@ -599,7 +599,7 @@ WALL FIXTURE ROTATION RULES (CRITICAL — always follow):
 
     response = client.chat.completions.create(
         model=AI_MODEL,
-        messages=[{"role": "user", "content": user_content}],
+        messages=[{"role": "user", "content": user_content}],  # type: ignore[arg-type]
         max_tokens=16384,
     )
 
