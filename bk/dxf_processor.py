@@ -1441,6 +1441,12 @@ class DXFProcessor:
         ('cash counter 1.20',            'cash counter 1,20w.dxf'),
         ('cash counter 1.80',            'cash counter 1.80w.dxf'),
         ('cash counter',                 'cash counter 1.80w.dxf'),
+
+        # ── BOH rooms ──────────────────────────────────────────────────────────
+        ('electrical room',              'Electrical Room.dxf'),
+        ('fitting lab',                  'Fitting Lab(Semi Edger Machine).dxf'),
+        ('clinic tran table',            'Clinic Tran Table (1.25W).dxf'),
+        ('small clinic table',           'Small Clinic Table (0.45W).dxf'),
     ]
 
     @staticmethod
@@ -1448,13 +1454,37 @@ class DXFProcessor:
         """Return absolute path to the backend/fixtures/ directory."""
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures')
 
-    def _find_fixture_dxf(self, fixture_name: str):
+    def _find_fixture_dxf(self, fixture_name: str, store_area_sqft: float = None):
         """
         Return the full path to the best-matching fixture DXF file, or None.
         Matching is case-insensitive, first-match-wins against _FIXTURE_DXF_CATALOGUE.
+
+        Pantry and Toilet have multiple DXF files by store-size bracket, so they
+        are resolved against store_area_sqft before falling back to the
+        keyword catalogue (which has no entry for them).
         """
         name_low = fixture_name.lower()
         fdir = self._fixtures_dir()
+        area = store_area_sqft if store_area_sqft is not None else 700  # mid-bracket default
+
+        if 'pantry' in name_low:
+            if area > 850:
+                filename = 'Pantry(Stores above 850 Sqft area).dxf'
+            elif area < 500:
+                filename = 'Pantry(Stores below 500 Sqft area.dxf'
+            else:
+                filename = 'Pantry(Stores between 500 to 850Sqft area.dxf'
+            path = os.path.join(fdir, filename)
+            if os.path.exists(path):
+                return path
+
+        if 'toilet' in name_low or 'wash room' in name_low:
+            filename = ('Toilet(Stores above 850Sqft).dxf' if area > 850
+                        else 'Toilet (Store area 500-850 Sqft).dxf')
+            path = os.path.join(fdir, filename)
+            if os.path.exists(path):
+                return path
+
         for keyword, filename in self._FIXTURE_DXF_CATALOGUE:
             if keyword in name_low:
                 path = os.path.join(fdir, filename)
@@ -1631,6 +1661,19 @@ class DXFProcessor:
         store_w = store_bounds['max'][0] - raw_min_x
         store_d = store_bounds['max'][1] - raw_min_y
 
+        # Actual polygon area (Shoelace) when available, else bounding box —
+        # used to pick the right Pantry/Toilet DXF size-bracket variant.
+        if store_polygon and len(store_polygon) >= 3:
+            n = len(store_polygon)
+            _area_mm2 = abs(sum(
+                store_polygon[i][0] * store_polygon[(i + 1) % n][1] -
+                store_polygon[(i + 1) % n][0] * store_polygon[i][1]
+                for i in range(n)
+            )) / 2.0
+        else:
+            _area_mm2 = store_w * store_d
+        store_area_sqft = (_area_mm2 / 1_000_000) * 10.7639
+
         # ── draw store outline ────────────────────────────────────────────────
         if store_polygon and len(store_polygon) >= 3:
             pts_norm = [(pt[0] - raw_min_x, pt[1] - raw_min_y)
@@ -1672,26 +1715,41 @@ class DXFProcessor:
             y_abs = max(0.0, min(y_abs, store_d - d))
 
             # ── Try to use real fixture DXF shape ────────────────────────────
-            fix_path = self._find_fixture_dxf(fixture_name)
+            fix_path = self._find_fixture_dxf(fixture_name, store_area_sqft=store_area_sqft)
             used_shape = False
 
             if fix_path is not None:
-                # Each unique (fix_path, w, d) combination gets its own block
-                # so that different sizes of the same fixture type are distinct.
-                cache_key = (fix_path, round(w), round(d))
+                # Block geometry is defined using the fixture's NATURAL
+                # (unrotated) dimensions w0×d0, so the artwork keeps its
+                # correct proportions/orientation. Rotation is then applied
+                # as a real INSERT rotation rather than by stretching the
+                # drawing into the swapped w×d footprint.
+                cache_key = (fix_path, round(w0), round(d0))
                 if cache_key not in _block_cache:
                     _block_counter[0] += 1
                     bname = f'FIX_{_block_counter[0]:04d}'
-                    ok = self._define_fixture_block(new_doc, bname, fix_path, w, d)
+                    ok = self._define_fixture_block(new_doc, bname, fix_path, w0, d0)
                     _block_cache[cache_key] = bname if ok else None
 
                 bname = _block_cache[cache_key]
                 if bname is not None:
-                    # Insert the block at the bottom-left corner of the fixture
+                    # Insertion point is offset so the rotated block's
+                    # bounding box still lands exactly on
+                    # [x_abs, x_abs+w] x [y_abs, y_abs+d].
+                    rot_norm = rot % 360
+                    if rot_norm == 90:
+                        ins = (x_abs + d0, y_abs)
+                    elif rot_norm == 180:
+                        ins = (x_abs + w0, y_abs + d0)
+                    elif rot_norm == 270:
+                        ins = (x_abs, y_abs + w0)
+                    else:
+                        rot_norm = 0
+                        ins = (x_abs, y_abs)
                     new_msp.add_blockref(
                         bname,
-                        insert=(x_abs, y_abs),
-                        dxfattribs={'layer': 'AI_FIXTURES'},
+                        insert=ins,
+                        dxfattribs={'layer': 'AI_FIXTURES', 'rotation': rot_norm},
                     )
                     used_shape = True
 

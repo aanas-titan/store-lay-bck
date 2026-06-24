@@ -270,7 +270,8 @@ def _enrich_placement(p: dict) -> dict:
 
 
 def get_ai_layout_placements(store_boundary, selected_fixtures, constraints,
-                              requirements=None, reference_file_path=None):
+                              requirements=None, reference_file_path=None,
+                              doors=None, columns=None):
     """
     Call GPT-40 via Titan AI Gateway to get EXACT x,y placement coordinates
     for every fixture and room.
@@ -282,6 +283,8 @@ def get_ai_layout_placements(store_boundary, selected_fixtures, constraints,
     Coordinates passed to the AI are normalized so the store bottom-left = (0, 0).
     requirements: dict with all store requirements.
     reference_file_path: optional path to reference image/pdf.
+    doors: optional list of {'x','y','radius'} in raw DXF mm — entrance/door swing zones.
+    columns: optional list of {'x','y','width','height'} in raw DXF mm — structural columns/beams.
     """
     api_key = _get_api_key()
     if not api_key:
@@ -346,6 +349,30 @@ def get_ai_layout_placements(store_boundary, selected_fixtures, constraints,
         return f"irregular polygon {sw:.0f} mm × {sd:.0f} mm — place fixtures only within the polygon vertices"
 
     shape_desc = _describe_polygon_shape(norm_polygon, store_w, store_d)
+
+    # ── Obstacles: doors (entrance swing) + structural columns/beams ──────
+    obstacle_lines = []
+    for door in (doors or []):
+        dx = round(door['x'] - origin_x)
+        dy = round(door['y'] - origin_y)
+        r = door.get('radius', 900)
+        obstacle_lines.append(
+            f"- DOOR/ENTRANCE swing at ({dx}, {dy}), radius {r:.0f} mm — "
+            f"keep a 1500 mm clearance, no fixture may block this swing arc."
+        )
+    for col in (columns or []):
+        cx = round(col['x'] - origin_x)
+        cy = round(col['y'] - origin_y)
+        cw = col.get('width', 400)
+        cd = col.get('height', 400)
+        obstacle_lines.append(
+            f"- COLUMN/BEAM at ({cx}, {cy}), footprint {cw:.0f}×{cd:.0f} mm — "
+            f"keep a 300 mm clearance, no fixture may overlap this column."
+        )
+    obstacles_desc = (
+        "\n".join(obstacle_lines) if obstacle_lines
+        else "None detected — no doors or columns to avoid."
+    )
 
     # Requirements extraction
     branch_name       = requirements.get('branch_name', 'Titan Eyewear')
@@ -448,6 +475,11 @@ Entrance wall: {entrance_wall} → {entrance_edge}
 North direction: {north_dir} wall faces North
 {ceiling_note}
 {pillar_note}
+
+═══════════════════════════════════════════════════════════════
+OBSTACLES — MANDATORY CLEARANCE (from the uploaded DXF)
+═══════════════════════════════════════════════════════════════
+{obstacles_desc}
 BAY_BIG: {bay_big_side} side | BAY_SMALL: {'RIGHT' if bay_big_side == 'LEFT' else 'LEFT'} side
 Minimum walkway: {walkway_w} mm | Min gap between fixtures: {min_spacing} mm
 
@@ -509,6 +541,7 @@ HARD CONSTRAINTS (never violate)
 9. Fitting Lab FIXED size: 1370 × 1830 mm.
 10. Clinic sizes: Phoropter = {clinic_size_str}.
 11. ONLY place fixtures/rooms that appear in the "FIXTURES TO PLACE" or "ROOMS TO PLACE" lists below. Do NOT invent, add, or substitute any fixture that is not explicitly listed there — not even commonly-expected items like a cash counter.
+12. NO fixture may overlap a door swing arc or column/beam footprint listed in OBSTACLES above (respect the stated clearance).
 
 ═══════════════════════════════════════════════════════════════
 OUTPUT FORMAT — STRICT JSON ONLY

@@ -494,6 +494,8 @@ def ai_layout_dxf():
                 constraints,
                 requirements=requirements,
                 reference_file_path=reference_file_path,
+                doors=layout_doors,
+                columns=layout_columns,
             )
             if ai_placements and len(ai_placements) > 0:
                 # Drop any placement the AI hallucinated that wasn't actually
@@ -520,12 +522,17 @@ def ai_layout_dxf():
             ai_placements = None
 
         # ── FALLBACK: GridLayoutEngine if AI failed ───────────────────────
+        # AI is the only layout we show the user; the grid engine only
+        # steps in silently if the AI call failed entirely, and even then
+        # we surface just its single best-scoring variant.
         if not ai_placements:
             engine = GridLayoutEngine(
                 store_boundary, requirements, selected_fixtures,
                 doors=layout_doors, columns=layout_columns,
             )
-            grid_variants = engine.generate_all_variants()
+            _best = engine.generate_all_variants()[0]
+            _best['source'] = 'grid_engine'
+            grid_variants = [_best]
         else:
             # Wrap AI placements into the same 3-variant structure
             # Score the AI placements using GridLayoutEngine scorer
@@ -593,7 +600,9 @@ def ai_layout_dxf():
 
             if not ai_placements:
                 # All AI placements were invalid — fall back to grid engine
-                grid_variants = engine.generate_all_variants()
+                _best = engine.generate_all_variants()[0]
+                _best['source'] = 'grid_engine'
+                grid_variants = [_best]
                 placement_source = 'grid_engine'
             else:
                 # ── Per-fixture fallback: fill in anything the AI missed ──────
@@ -729,6 +738,26 @@ def ai_layout_dxf():
                             cp['y'] = cy
                             break
 
+                def _others(p):
+                    return [o for o in ai_placements if o is not p]
+
+                def _fits(p, x, y, fw, fd):
+                    return (engine._in_store(x, y, fw, fd)
+                            and not engine._hits_obstacle(x, y, fw, fd)
+                            and not engine._overlaps(_others(p), x, y, fw, fd, gap=150))
+
+                def _find_slot_in_zone(p, fw, fd, zx1, zx2, zy1, zy2, gap, start_x, start_y):
+                    """Row-pack search for a non-overlapping slot inside a zone."""
+                    cy = start_y
+                    while cy + fd <= zy2 - gap:
+                        cx = start_x if cy == start_y else zx1 + gap
+                        while cx + fw <= zx2 - gap:
+                            if _fits(p, cx, cy, fw, fd):
+                                return (int(cx), int(cy))
+                            cx += gap
+                        cy += gap
+                    return None
+
                 # --- 2. Clinics → CLINIC zone (mid-rear) ---------------------
                 _zones = engine._zones()
                 clinic_zone = _zones.get('CLINIC', _zones.get('SERVICE'))
@@ -745,20 +774,23 @@ def ai_layout_dxf():
                         rot = p.get('rotation', 0) in (90, 270)
                         fw = p['d'] if rot else p['l']
                         fd = p['l'] if rot else p['d']
-                        # Check if already inside clinic zone
+                        # Check if already inside clinic zone AND not colliding
                         already_ok = (
                             czx1 <= p['x'] and p['x'] + fw <= czx2 and
                             czy1 <= p['y'] and p['y'] + fd <= czy2
+                            and _fits(p, p['x'], p['y'], fw, fd)
                         )
                         if not already_ok:
-                            # Try to place at cursor position within clinic zone
-                            if _cx_cursor + fw > czx2 - _gap:
-                                _cx_cursor = czx1 + _gap
-                                _cy_cursor += fd + _gap
-                            if _cy_cursor + fd <= czy2 - _gap:
-                                p['x'] = int(_cx_cursor)
-                                p['y'] = int(_cy_cursor)
-                            _cx_cursor += fw + _gap
+                            slot = _find_slot_in_zone(
+                                p, fw, fd, czx1, czx2, czy1, czy2, _gap,
+                                _cx_cursor, _cy_cursor,
+                            )
+                            if slot:
+                                p['x'], p['y'] = slot
+                                _cx_cursor = slot[0] + fw + _gap
+                                _cy_cursor = slot[1]
+                            # else: leave original AI position — later passes
+                            # (overlap-removal / recovery) will handle it.
 
                 # --- 3. BOH rooms → BOH zone (rear) --------------------------
                 boh_zone = _zones.get('BOH')
@@ -772,7 +804,6 @@ def ai_layout_dxf():
                     _bgap = 300
                     _bx = bzx1 + _bgap
                     _by = bzy1 + _bgap
-                    _brow_h = 0
                     for p in ai_placements:
                         pname_low = p['fixture'].lower()
                         if not any(k in pname_low for k in _BOH_NAMES):
@@ -783,17 +814,18 @@ def ai_layout_dxf():
                         already_ok = (
                             bzx1 <= p['x'] and p['x'] + fw <= bzx2 and
                             bzy1 <= p['y'] and p['y'] + fd <= bzy2
+                            and _fits(p, p['x'], p['y'], fw, fd)
                         )
                         if not already_ok:
-                            if _bx + fw > bzx2 - _bgap:
-                                _bx = bzx1 + _bgap
-                                _by += _brow_h + _bgap
-                                _brow_h = 0
-                            if _by + fd <= bzy2 - _bgap:
-                                p['x'] = int(_bx)
-                                p['y'] = int(_by)
-                                _brow_h = max(_brow_h, fd)
-                            _bx += fw + _bgap
+                            slot = _find_slot_in_zone(
+                                p, fw, fd, bzx1, bzx2, bzy1, bzy2, _bgap,
+                                _bx, _by,
+                            )
+                            if slot:
+                                p['x'], p['y'] = slot
+                                _bx = slot[0] + fw + _bgap
+                                _by = slot[1]
+                            # else: leave original AI position
 
                 # --- 4. Wall fixture rotation enforcement -------------------
                 # The AI frequently places wall fixtures with rotation=0
@@ -810,6 +842,19 @@ def ai_layout_dxf():
                     'smart display', 'contact lens',
                 }
                 _WALL_THRESHOLD = W * 0.25  # within 25% of store width = near a wall
+
+                def _slide_along_wall(p, fw, fd, fixed_x, target_y, step=150):
+                    """Search up/down from target_y for a free slot at fixed_x."""
+                    if _fits(p, fixed_x, target_y, fw, fd):
+                        return target_y
+                    offset = step
+                    while offset <= D:
+                        for cand_y in (target_y - offset, target_y + offset):
+                            cand_y = max(50, min(cand_y, int(D - fd - 50)))
+                            if _fits(p, fixed_x, cand_y, fw, fd):
+                                return cand_y
+                        offset += step
+                    return None
 
                 for p in ai_placements:
                     if p.get('zone') not in _WALL_FIXTURE_ZONES:
@@ -828,19 +873,33 @@ def ai_layout_dxf():
                     if near_left or near_right:
                         # Switch to rotation=90: long side (l) runs along Y axis
                         # effective_w = d (depth), effective_d = l (length)
-                        p['rotation'] = 90
-                        if near_left:
-                            p['x'] = 50  # flush against left wall
-                        else:
-                            p['x'] = int(W - pd - 50)  # flush against right wall
-                        # Clamp y so fixture stays inside store
-                        p['y'] = max(50, min(p['y'], int(D - pl - 50)))
+                        new_x = 50 if near_left else int(W - pd - 50)
+                        target_y = max(50, min(p['y'], int(D - pl - 50)))
+                        new_y = _slide_along_wall(p, pd, pl, new_x, target_y)
+                        if new_y is not None:
+                            p['rotation'] = 90
+                            p['x'] = new_x
+                            p['y'] = new_y
+                        # else: leave original placement untouched
 
                 # --- 4b. Wall-snap pass: force wall fixtures to actual walls --
                 # If a wall fixture is NOT near any wall (floating in center),
                 # snap it to the nearest wall based on its x position.
                 _WALL_SNAP_MARGIN = 50   # mm from wall face
                 _RETAIL_Y_MAX = D * 0.80  # don't snap into clinic/BOH zone
+
+                def _slide_along_wall_h(p, fw, fd, fixed_y, target_x, step=150):
+                    """Search left/right from target_x for a free slot at fixed_y."""
+                    if _fits(p, target_x, fixed_y, fw, fd):
+                        return target_x
+                    offset = step
+                    while offset <= W:
+                        for cand_x in (target_x - offset, target_x + offset):
+                            cand_x = max(50, min(cand_x, int(W - fw - 50)))
+                            if _fits(p, cand_x, fixed_y, fw, fd):
+                                return cand_x
+                        offset += step
+                    return None
 
                 for p in ai_placements:
                     if p.get('zone') not in _WALL_FIXTURE_ZONES:
@@ -866,24 +925,38 @@ def ai_layout_dxf():
                         min_dist = min(dist_left, dist_right, dist_bottom, dist_top)
                         if min_dist == dist_left:
                             # Snap to left wall with rotation=90
-                            p['rotation'] = 90
-                            p['x'] = _WALL_SNAP_MARGIN
-                            p['y'] = max(_WALL_SNAP_MARGIN, min(py, int(D - p['l'] - _WALL_SNAP_MARGIN)))
+                            new_y = _slide_along_wall(p, p['d'], p['l'], _WALL_SNAP_MARGIN,
+                                                       max(_WALL_SNAP_MARGIN, min(py, int(D - p['l'] - _WALL_SNAP_MARGIN))))
+                            if new_y is not None:
+                                p['rotation'] = 90
+                                p['x'] = _WALL_SNAP_MARGIN
+                                p['y'] = new_y
                         elif min_dist == dist_right:
                             # Snap to right wall with rotation=90
-                            p['rotation'] = 90
-                            p['x'] = int(W - p['d'] - _WALL_SNAP_MARGIN)
-                            p['y'] = max(_WALL_SNAP_MARGIN, min(py, int(D - p['l'] - _WALL_SNAP_MARGIN)))
+                            snap_x = int(W - p['d'] - _WALL_SNAP_MARGIN)
+                            new_y = _slide_along_wall(p, p['d'], p['l'], snap_x,
+                                                       max(_WALL_SNAP_MARGIN, min(py, int(D - p['l'] - _WALL_SNAP_MARGIN))))
+                            if new_y is not None:
+                                p['rotation'] = 90
+                                p['x'] = snap_x
+                                p['y'] = new_y
                         elif min_dist == dist_bottom:
                             # Snap to bottom wall (entrance) with rotation=0
-                            p['rotation'] = 0
-                            p['y'] = _WALL_SNAP_MARGIN
-                            p['x'] = max(_WALL_SNAP_MARGIN, min(px, int(W - p['l'] - _WALL_SNAP_MARGIN)))
+                            new_x = _slide_along_wall_h(p, p['l'], p['d'], _WALL_SNAP_MARGIN,
+                                                         max(_WALL_SNAP_MARGIN, min(px, int(W - p['l'] - _WALL_SNAP_MARGIN))))
+                            if new_x is not None:
+                                p['rotation'] = 0
+                                p['y'] = _WALL_SNAP_MARGIN
+                                p['x'] = new_x
                         else:
                             # Snap to top wall with rotation=0
-                            p['rotation'] = 0
-                            p['y'] = int(D - p['d'] - _WALL_SNAP_MARGIN)
-                            p['x'] = max(_WALL_SNAP_MARGIN, min(px, int(W - p['l'] - _WALL_SNAP_MARGIN)))
+                            snap_y = int(D - p['d'] - _WALL_SNAP_MARGIN)
+                            new_x = _slide_along_wall_h(p, p['l'], p['d'], snap_y,
+                                                         max(_WALL_SNAP_MARGIN, min(px, int(W - p['l'] - _WALL_SNAP_MARGIN))))
+                            if new_x is not None:
+                                p['rotation'] = 0
+                                p['y'] = snap_y
+                                p['x'] = new_x
 
                 # --- 5. Door & column clearance enforcement ------------------
                 # The AI ignores door clearance zones entirely.  Build the
@@ -1040,10 +1113,9 @@ def ai_layout_dxf():
         if ai_placements:
             ai_score = engine._score(ai_placements)
 
-            # Also generate 2 grid variants as alternatives
-            p2, s2 = engine.generate_racetrack_loop()
-            p3, s3 = engine.generate_premium_open()
-
+            # Only the AI-generated layout is shown to the user — no grid
+            # alternates. The grid engine remains available purely as the
+            # silent fallback above when the AI fails outright.
             grid_variants = [
                 {
                     'name': ai_layout_style or 'AI Layout',
@@ -1058,33 +1130,7 @@ def ai_layout_dxf():
                     'score': ai_score,
                     'source': 'ai',
                 },
-                {
-                    'name': 'Racetrack Loop (Grid)',
-                    'description': (
-                        'Perimeter displays with a wide central loop aisle. '
-                        'Optimal customer flow. Clinics tucked in rear corners. '
-                        'Cash counter in South-West (Vastu). BOH at rear.'
-                    ),
-                    'style': 'RACETRACK_LOOP',
-                    'placements': p2,
-                    'score': s2,
-                    'source': 'grid_engine',
-                },
-                {
-                    'name': 'Premium Open (Grid)',
-                    'description': (
-                        'Open plan with luxury positioning near entrance and wider walkways. '
-                        'Clinics in rear. Cash counter in South-West (Vastu). '
-                        'Ideal for flagship/premium stores.'
-                    ),
-                    'style': 'PREMIUM_OPEN',
-                    'placements': p3,
-                    'score': s3,
-                    'source': 'grid_engine',
-                },
             ]
-            # Sort best-first (AI layout first if it scored well)
-            grid_variants.sort(key=lambda v: v['score'], reverse=True)
 
         variants = grid_variants
 
